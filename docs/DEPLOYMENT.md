@@ -231,7 +231,7 @@ ssh root@115.159.96.81 'chown 10002:10002 /opt/oppo-health/data/auth.json && chm
 
 ## 10. 已知限制
 
-1. **目前是 HTTP，不是 HTTPS**。Bearer Token 与健康数据在公网明文传输。需要域名 + 证书才能上 TLS（见第 11 节）。
+1. **目前是 HTTP，不是 HTTPS**（用户 2026-10-28 明确选择暂时保持 HTTP）。Bearer Token 与健康数据在公网明文传输：不要在公共 Wi-Fi、公司网络或任何不可信链路上使用；也不要把面板地址发给别人。需要域名 + 证书才能上 TLS（见第 11 节）。
 2. **单实例**。SQLite + 单容器，不要开多个 worker 或多副本。
 3. **步骤统计有历史缺口**。`steps_stat` 近 7 天可能返回 0 条（云端确实无数据），120 天窗口实测可拉到 137 条记录。
 4. **`sport_file` 不可用**：缺 `encryptKeyEnc`，运动轨迹无法展示。
