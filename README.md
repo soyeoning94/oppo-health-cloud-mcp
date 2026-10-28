@@ -2,6 +2,11 @@
 
 OPPO 健康（欢太健康）云端 API 直连客户端 + MCP server。无需 root / LSPosed，从云端拉取你自己的健康明细数据（心率/血氧/步数/睡眠/体重/腕温/HRV/压力/身心健康/呼吸率等），供任意 AI agent 分析。
 
+支持两种运行方式：
+
+- **本地 stdio**：`python3 cloud_mcp.py`，给本机 Claude Desktop / Cursor / Hermes 用。
+- **远程 Streamable HTTP**：`python3 app_server.py`，一个进程同时提供 MCP、管理 API 和中文管理面板，可部署在服务器上给多个 Agent 共用（见[远程部署](#远程服务streamable-http--管理面板)）。
+
 > ⚠️ **仅供本人学习研究**。导出的是你自己的健康数据，请勿用于侵犯他人隐私或商用。
 
 ## 原理
@@ -106,14 +111,82 @@ APK 还声明了健康档案、健康指标、疾病风险和复诊计划接口�
 
 压力与身心健康的 `cloud_query` 结果按子数据集分组。若 HRV 独立接口没有记录，MCP 会从身心健康明细的 `hrv` 子项生成对应记录，并标注 `source: physical_mental_detail`，同时保留原始 `startTimeOffset`。压力和身心健康结果也会筛选近期记录；版本游标接口按服务端分页规则遍历版本。
 
+## 远程服务（Streamable HTTP + 管理面板）
+
+`app_server.py` 把 MCP、管理 API 和面板合成一个 ASGI 进程，适合长期跑在服务器上给多个 Agent 共用。
+
+```
+浏览器 / Agent
+      │  Bearer Token
+      ▼
+Nginx（80/443，路径 /oppo-health/）
+      ▼
+app_server.py  (FastMCP Streamable HTTP + /api/* + dashboard.html)
+      ▼
+cloud_cache.db (SQLite, WAL)
+      ▲
+      │  HMAC-SHA256 签名 + curl TLS 指纹
+OPPO 健康云
+```
+
+### 接口
+
+| 接口 | 路径 | 鉴权 |
+|---|---|---|
+| MCP（Streamable HTTP） | `/mcp` | `Authorization: Bearer <token>` |
+| 管理面板 | `/` | 页面可匿名加载，数据需 Token |
+| 摘要 / 状态 / 查询 / 同步 | `/api/summary`、`/api/status`、`/api/query`、`/api/sync` | Bearer |
+| 健康检查 | `/healthz` | 匿名，仅返回存活 |
+
+### 本地起服务
+
+```bash
+export OPPO_HEALTH_API_TOKEN=$(openssl rand -hex 32)
+export OPPO_HEALTH_PUBLIC_HOSTS=127.0.0.1
+python3 app_server.py            # 默认 127.0.0.1:9333
+```
+
+浏览器打开 `http://127.0.0.1:9333/`，粘贴同一个 Token 即可看到快照、趋势、缓存覆盖和同步记录。
+
+### 面板能看什么
+
+- 最新快照：步数、睡眠分期、心率、血氧、HRV、压力，每项标注 `原始 / 厂商汇总 / 本地计算`。
+- 有数据日期趋势：心率、血氧、睡眠、步数、HRV；只有 1 个数据日期时显示「样本不足」，不画假趋势线。
+- 缓存覆盖与时效：每个数据集的记录数、覆盖天数、最后日期、是否滞后。
+- 最近同步记录：指标、窗口、写入条数、耗时、成功/失败原因（来自 `sync_log` 表）。
+
+### 统计口径
+
+`cloud_analyze(days)` 和面板的每个数字都带 `provenance`：
+
+| 标签 | 含义 |
+|---|---|
+| `raw` | 云端原始记录，只做单位换算 |
+| `vendor_summary` | OPPO 算法/汇总结果，原样转述，不重算 |
+| `local_derived` | 本服务用原始明细算出的求和/时长/均值/中位数 |
+
+不做医疗诊断、不合成健康评分、不把厂商筛查结果改写为疾病名。
+
+### 文档
+
+- [部署说明](docs/DEPLOYMENT.md)：架构、服务器布局、环境变量、首次部署、更新、运维、回滚、认证续期、HTTPS。
+- [Agent 连接配置](docs/AGENT-CONNECT.md)：Claude Desktop/Code、Cursor、VS Code、Hermes、Python SDK、Node SDK、curl。
+- [开发与踩坑记录](docs/DEVELOPMENT.md)：改动清单、设计取舍、开发/部署中遇到的问题与解决办法。
+- [面板统计设计](docs/panel-stats-design.md)：67 项指标分级、单位换算、医疗化红线、API 契约。
+
 ## 踩坑记录（重要）
 
 | 坑 | 结论 |
 |---|---|
 | python urllib/requests 全部 403 `10103` | **TLS 指纹拦截**。必须 curl 子进程（okhttp 指纹相近），真假 token 差分法会失效 |
 | 加了 `virtual-ssoid` 头 / gzip 头 → `10100` | **多余头参与验签**。只发精确 HAR 头集，ssoid 走 body 的 userTagId |
-| v5 pull* 端点回 `23103` | 单次范围 ≤1 天，按天循环 |
+| v5 pull* 端点回 `23103` | 单次范围 ≤ 1 天，按天循环 |
 | steps 响应是 dict，心率/血氧是数组 | 解析需兼容两种结构 |
+| 统计接口 7 天窗口也回 `23103` | 按 7 天分窗 + 遇到 `23103` 二分；部分老端点只认 `0/0` 游标，需兜底 |
+| FastMCP 反代后 `421 Invalid Host header` | 必须把公网域名/IP 加进 `TransportSecuritySettings.allowed_hosts` |
+| Nginx 同时开 Basic Auth 和 Bearer | `Authorization` 头只能承载一种凭据，MCP 路径必须 `auth_basic off` |
+| 同步工具直接注册成 MCP tool 会卡住整个服务 | OPPO 请求是阻塞 curl，必须 `anyio.to_thread.run_sync` 包一层 |
+| 容器重建后页面没变 | `dashboard.html` 打进镜像，`docker compose up -d` 不生效，要带 `--build` |
 
 错误码分层：`10103`=网关层(TLS/头)，`10100`=验签层(头污染)，`23103`=业务层(范围)，`0`=成功。
 

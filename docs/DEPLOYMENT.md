@@ -188,7 +188,26 @@ docker exec service-portal-gateway nginx -t && docker exec service-portal-gatewa
 
 当前 `auth.json` 的 `accessTokenExp` 是 **2026-11-27 02:13**（+08:00）。到期后云端会返回 `10101`，同步停止。
 
-续期流程（手机需 root + adb 无线调试）：
+### 方式 A：短信登录（推荐，无需 root）
+
+上游 `oppo_login.py` 复刻了欢太账号 OpenSDK 的登录流程，直接换 health 包级 token 并写入 `auth.json`：
+
+```bash
+pip install requests pycryptodome
+python3 oppo_login.py config     # 首次：填手机号等配置
+python3 oppo_login.py login      # 交互式输入验证码（必要时补身份证后 6 位）
+```
+
+成功后把生成的 `auth.json` 上传到服务器：
+
+```bash
+scp auth.json root@115.159.96.81:/opt/oppo-health/data/
+ssh root@115.159.96.81 'chown 10002:10002 /opt/oppo-health/data/auth.json && chmod 600 /opt/oppo-health/data/auth.json && cd /opt/oppo-health && docker restart oppo-health-mcp'
+```
+
+### 方式 B：从 root 手机读取（备用）
+
+手机需 root + adb 无线调试：
 
 ```bash
 # 1. 手机与电脑同一局域网，开发者选项 → 无线调试
