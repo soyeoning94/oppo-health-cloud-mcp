@@ -16,8 +16,9 @@ import base64, datetime, hashlib, hmac, json, os, sqlite3, struct, time, urllib.
 from typing import Literal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-AUTH_FILE = os.path.join(HERE, "auth.json")
-CACHE_DB = os.path.join(HERE, "cloud_cache.db")
+DATA_DIR = os.environ.get("OPPO_HEALTH_DATA_DIR", HERE)
+AUTH_FILE = os.environ.get("OPPO_HEALTH_AUTH_FILE", os.path.join(DATA_DIR, "auth.json"))
+CACHE_DB = os.environ.get("OPPO_HEALTH_CACHE_DB", os.path.join(DATA_DIR, "cloud_cache.db"))
 HOST = "https://sport.health.heytapmobi.com/sporthealth/"
 
 APPID = "M2QfBThPRpGcGovBva3ENX"
@@ -263,10 +264,21 @@ def _post(path, body_obj, auth, timeout=20):
         return {"http_error": r.returncode, "body": "non_json_response"}
 
 def _db():
-    con = sqlite3.connect(CACHE_DB)
+    os.makedirs(os.path.dirname(os.path.abspath(CACHE_DB)), exist_ok=True)
+    con = sqlite3.connect(CACHE_DB, timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS cloud_data(
         metric TEXT, date TEXT, payload TEXT, fetched_at INTEGER,
         PRIMARY KEY(metric, date))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS sync_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric TEXT NOT NULL,
+        days INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER NOT NULL,
+        rows_cached INTEGER,
+        error TEXT)""")
     return con
 
 def _cache(metric: str, items: list) -> int:
@@ -329,7 +341,7 @@ def _fetch_versioned_sport(metric, auth, days):
     for _ in range(100):
         response = _post(version_endpoint, {field: max(cursor, since), "queryFlag": 0}, auth)
         if not _api_ok(response):
-            return None, response.get("errorCode")
+            return None, response.get("errorCode") or f"http_error:{response.get('http_error')}"
         body = response.get("body") or {}
         page = _version_values(body)
         if not page:
@@ -366,7 +378,7 @@ def _fetch_versions(path, auth, query_flag=None, since=0):
             request["queryFlag"] = query_flag
         response = _post(path, request, auth)
         if not _api_ok(response):
-            return None, response.get("errorCode")
+            return None, response.get("errorCode") or f"http_error:{response.get('http_error')}"
         body = response.get("body") or {}
         page = _version_values(body)
         if not page:
@@ -390,6 +402,8 @@ def _fetch_versioned_details(metric, auth, days):
                                       since=_first_day_timestamp(days))
     if error is not None:
         return None, error
+    if not versions:
+        return [], None
     items = []
     detail_field = DETAIL_VERSION_FIELDS.get(metric, "modifiedTimestamp")
     for modified_ts in versions:
@@ -399,9 +413,49 @@ def _fetch_versioned_details(metric, auth, days):
             request["queryFlag"] = query_flag
         response = _post(ENDPOINTS[metric][0], request, auth)
         if not _api_ok(response):
-            return None, response.get("errorCode")
+            return None, response.get("errorCode") or f"http_error:{response.get('http_error')}"
         items.extend(_records(response.get("body")))
     return items, None
+
+def _stat_window(endpoint, auth, start, end):
+    """Fetch one left-open/right-closed stat interval, bisecting server-rejected windows."""
+    response = _post(endpoint, {
+        "queryFlag": 0,
+        "startModifiedTimestamp": start,
+        "endModifiedTimestamp": end,
+    }, auth)
+    if not _api_ok(response):
+        error = response.get("errorCode") or f"http_error:{response.get('http_error')}"
+        minimum_window = 24 * 60 * 60 * 1000
+        if error in (23103, "23103") and end - start > minimum_window:
+            midpoint = start + (end - start) // 2
+            left, left_error = _stat_window(endpoint, auth, start, midpoint)
+            if left_error is not None:
+                return None, left_error
+            right, right_error = _stat_window(endpoint, auth, midpoint, end)
+            if right_error is not None:
+                return None, right_error
+            return left + right, None
+        return None, error
+
+    body = response.get("body") or {}
+    items = _records(body)
+    if not isinstance(body, dict) or not body.get("hasMore") or not items:
+        return items, None
+
+    page_versions = [int(value) for row in items if isinstance(row, dict)
+                     for value in [row.get("modifiedTimestamp", row.get("modifiedTime"))]
+                     if value is not None]
+    if not page_versions:
+        return items, None
+    next_start = max(page_versions)
+    if next_start <= start or next_start >= end:
+        return items, None
+    more, error = _stat_window(endpoint, auth, next_start, end)
+    if error is not None:
+        return None, error
+    return items + more, None
+
 
 def _fetch_versioned_stats(metric, auth, days):
     versions, error = _fetch_versions(VERSIONED_STATS[metric], auth, query_flag=0,
@@ -411,41 +465,30 @@ def _fetch_versioned_stats(metric, auth, days):
     if not versions:
         return [], None
 
-    items = []
-    start = min(versions)
-    end = max(versions)
     endpoint = ENDPOINTS[metric][0]
-    zero_cursor = False
-    for _ in range(100):
-        if not zero_cursor and start > end:
-            break
-        request = {"queryFlag": 0, "startModifiedTimestamp": start,
-                   "endModifiedTimestamp": 0 if zero_cursor else end}
-        response = _post(endpoint, request, auth)
-        if not _api_ok(response):
-            if not zero_cursor:
-                # Some stat APIs only accept the service's zero/zero page cursor.
-                zero_cursor = True
-                start = 0
-                items.clear()
-                continue
-            return None, response.get("errorCode")
-        body = response.get("body") or {}
-        page = _records(body)
+    max_window = 7 * 24 * 60 * 60 * 1000
+    cursor = min(versions) - 1
+    final_end = max(versions)
+    items = []
+    while cursor < final_end:
+        window_end = min(cursor + max_window, final_end)
+        page, error = _stat_window(endpoint, auth, cursor, window_end)
+        if error is not None:
+            if error in (23103, "23103"):
+                fallback = _post(endpoint, {
+                    "queryFlag": 0,
+                    "startModifiedTimestamp": 0,
+                    "endModifiedTimestamp": 0,
+                }, auth)
+                if _api_ok(fallback):
+                    fallback_items = _records(fallback.get("body") or {})
+                    for item in fallback_items:
+                        if isinstance(item, dict):
+                            item.setdefault("source", "zero_cursor_fallback")
+                    return fallback_items, None
+            return None, error
         items.extend(page)
-        if not isinstance(body, dict) or not body.get("hasMore") or not page:
-            break
-        page_versions = [int(value) for row in page if isinstance(row, dict)
-                         for value in [row.get("modifiedTimestamp", row.get("modifiedTime"))]
-                         if value is not None]
-        if not page_versions:
-            break
-        next_start = max(page_versions) + 1
-        if next_start <= start:
-            break
-        start = next_start
-    else:
-        return None, "pagination_limit"
+        cursor = window_end
     return items, None
 
 def _beijing_day_window(day):
@@ -520,7 +563,59 @@ def _embedded_metric_items(metric, outer_items):
             result.append(row)
     return result
 
+def _log_sync(metric, days, started_at, rows_cached, error) -> None:
+    """Persist one sync attempt; never let logging break the sync itself."""
+    try:
+        con = _db()
+        con.execute(
+            "INSERT INTO sync_log(metric, days, started_at, finished_at, rows_cached, error)"
+            " VALUES (?,?,?,?,?,?)",
+            (str(metric), int(days), int(started_at), int(time.time()),
+             rows_cached, str(error) if error else None),
+        )
+        con.commit()
+        con.close()
+    except sqlite3.Error:
+        pass
+
+
+def sync_history(limit: int = 20) -> list:
+    """Most recent sync attempts, newest first."""
+    con = _db()
+    rows = con.execute(
+        "SELECT metric, days, started_at, finished_at, rows_cached, error"
+        " FROM sync_log ORDER BY id DESC LIMIT ?", (int(limit),)
+    ).fetchall()
+    con.close()
+    return [{
+        "metric": metric,
+        "days": days,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": (finished_at - started_at) * 1000 if finished_at and started_at else None,
+        "rows_cached": rows_cached,
+        "error": error,
+    } for metric, days, started_at, finished_at, rows_cached, error in rows]
+
+
 def cloud_sync(metric: MetricName, days: int = 7) -> dict:
+    """Run one sync and record it in sync_log, including failures."""
+    started_at = time.time()
+    try:
+        result = _cloud_sync_impl(metric, days)
+    except Exception as exc:  # noqa: BLE001 - record then re-raise
+        _log_sync(metric, days, started_at, None, f"{type(exc).__name__}: {exc}")
+        raise
+    error = result.get("error")
+    if error and result.get("errorCode") is not None:
+        error = f"{error} (errorCode={result['errorCode']})"
+    if not error and result.get("errors"):
+        error = "; ".join(str(item.get("error")) for item in result["errors"])
+    _log_sync(metric, days, started_at, result.get("rows_cached"), error)
+    return result
+
+
+def _cloud_sync_impl(metric: MetricName, days: int = 7) -> dict:
     """从云端拉取指定指标, 写入本地缓存.
     pull端点限制单次范围≤1天(23103), 内部按天循环.
     sleep: version游标全量(单条1请求, 仅增量ts); app_usage: date+queryFlag; weight: userTagId+pageSize."""
@@ -748,8 +843,8 @@ def _day_rows(con, metric):
             s = str(d["date"])
             yield f"{s[:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 else s, d
 
-def cloud_analyze(days: int = 7) -> dict:
-    """聚合分析本地缓存: 本周期 vs 上一周期环比 + 异常标记. 需先 cloud_sync 落数据."""
+def _legacy_cloud_analyze(days: int = 7) -> dict:
+    """Legacy text report retained for compatibility tests; not registered as an MCP tool."""
     con = _db()
     today = datetime.date.today()
     cur = {(today - datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)}
@@ -821,13 +916,25 @@ def cloud_analyze(days: int = 7) -> dict:
             "coverage": {"heart_rate_days": hr_days, "spo2_days": spo2_days,
                          "steps_days": steps_days, "sleep_days": sleep_days}}
 
+def cloud_analyze(days: int = 7) -> dict:
+    """Return structured, provenance-labelled descriptive analytics from the cache."""
+    from health_analytics import build_summary
+
+    result = build_summary(CACHE_DB)
+    result["days"] = max(1, days)
+    return result
+
+
 def cloud_status() -> dict:
     """检查 auth.json 和缓存状态."""
     ok = os.path.exists(AUTH_FILE)
     con = _db()
     stats = dict(con.execute("SELECT metric, COUNT(*) FROM cloud_data GROUP BY metric").fetchall())
     con.close()
-    return {"auth_ready": ok, "cache": stats,
+    last_sync = {}
+    for row in sync_history(200):
+        last_sync.setdefault(row["metric"], row)
+    return {"auth_ready": ok, "cache": stats, "last_sync": last_sync,
             "note": "auth.json 需含 token/token_auth_id/ssoid (抓包一次获取)"}
 
 def register_tools(server):

@@ -3,5 +3,11 @@ cookies.json
 auth.json.tmp
 sign_samples.json
 *.db
+*.db-wal
+*.db-shm
 __pycache__/
 *.log
+.venv/
+.impeccable/
+summary.local.json
+.pytest_cache/

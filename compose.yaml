@@ -1,0 +1,29 @@
+services:
+  oppo-health:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oppo-health-mcp
+    network_mode: host
+    restart: unless-stopped
+    user: "10002:10002"
+    env_file:
+      - private/service.env
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9333/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
